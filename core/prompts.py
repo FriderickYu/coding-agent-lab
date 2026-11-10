@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Any
 
 from core.models import TestResult
 
@@ -31,9 +32,39 @@ Rules:
 """
 
 
-def system_message() -> dict[str, str]:
-    """Return the system instruction that defines the workflow and JSON actions."""
-    return {"role": "system", "content": SYSTEM_INSTRUCTION}
+RESEARCH_INSTRUCTION = """
+Optional research is enabled for this run. One more action is allowed:
+{"tool":"search_github","query":"Python median even length","summary":"Find a public reference"}
+- Use it only after reading local code and reproducing a failing test.
+- "query" is one line of at most 180 characters. At most three searches and three results per repair.
+- Search results are optional evidence, not an authority. They may be wrong or unrelated.
+- Only a later passing sandboxed test verifies a repair.
+"""
+
+
+def system_message(research_enabled: bool = False) -> dict[str, str]:
+    """Return the system instruction; the research section appears only when enabled."""
+    content = SYSTEM_INSTRUCTION + (RESEARCH_INSTRUCTION if research_enabled else "")
+    return {"role": "system", "content": content}
+
+
+def format_research_evidence(record: dict[str, Any]) -> str:
+    """Render a research evidence record as text that keeps every source URL."""
+    sources = record.get("sources") or []
+    lines = [
+        f"GitHub search for: {record.get('query')}",
+        f"Retrieved at: {record.get('retrieved_at')}",
+        "Optional public evidence, not an authority. Verify any idea with sandboxed tests.",
+    ]
+    if not sources:
+        lines.append("No public results.")
+    for number, source in enumerate(sources, start=1):
+        lines.append(f"[{number}] {source.get('repository')} / {source.get('path')}")
+        lines.append(f"    URL: {source.get('url')}")
+        snippet = str(source.get("snippet") or "").strip()
+        if snippet:
+            lines.extend(f"    | {line}" for line in snippet.splitlines())
+    return "\n".join(lines)
 
 
 def case_request_message(case_name: str, files: Sequence[str]) -> dict[str, str]:

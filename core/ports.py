@@ -31,6 +31,14 @@ class RepairToolsPort(Protocol):
         ...
 
 
+class ResearchPort(Protocol):
+    """Optional, bounded public-code search. Separate from the sandbox file tools."""
+
+    def search_github(self, query: str) -> dict[str, Any]:
+        """Return a small JSON-compatible evidence record for one search query."""
+        ...
+
+
 class TraceRecorder(Protocol):
     """Optional sink for public repair trace events."""
 

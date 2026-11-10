@@ -29,11 +29,13 @@ def format_event(event: str, payload: dict[str, Any]) -> str:
     step = payload.get("decision")
     if event == "repair_started":
         files = ", ".join(payload.get("files", []))
-        return f"[start] project={payload.get('case')} budget={payload.get('max_decisions')} files: {files}"
+        research = " research=on" if payload.get("research_enabled") else ""
+        return f"[start] project={payload.get('case')} budget={payload.get('max_decisions')}{research} files: {files}"
     if event == "model_response":
         if not payload.get("valid"):
             return f"[{step}] model -> INVALID reply: {payload.get('error')}"
         target = f" {payload['path']}" if payload.get("path") else ""
+        target += f" query={payload['query']!r}" if payload.get("query") else ""
         summary = f"  ({payload['summary']})" if payload.get("summary") else ""
         return f"[{step}] model -> {payload.get('tool')}{target}{summary}"
     if event == "tool_result":
@@ -45,6 +47,9 @@ def format_event(event: str, payload: dict[str, Any]) -> str:
             verdict = "PASSED" if payload["passed"] else "FAILED"
             header = f"[{step}] {tool} {verdict} (exit {payload.get('returncode')})"
             return f"{header}\n{_indent(observation, tail=True)}"
+        if "sources" in payload:
+            urls = payload["sources"] or ["(no public results)"]
+            return f"[{step}] {tool} ok, sources:\n" + "\n".join(f"      {url}" for url in urls)
         return f"[{step}] {tool} ok:\n{_indent(observation)}"
     if event == "repair_finished":
         verdict = "REPAIRED" if payload.get("passed") else "NOT REPAIRED"
@@ -59,10 +64,10 @@ class PrintRecorder:
         print(format_event(event, payload), flush=True)
 
 
-def run_repair(project: str, provider: str) -> int:
+def run_repair(project: str, provider: str, research: bool = False) -> int:
     """Run one repair, print the trace and summary, and return the exit status."""
     try:
-        service = build_service(provider)
+        service = build_service(provider, research=research)
         result = service.repair(project, recorder=PrintRecorder())
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -98,6 +103,11 @@ def build_parser() -> argparse.ArgumentParser:
     repair = commands.add_parser("repair", help="Repair a copy of one supplied project under evals/.")
     repair.add_argument("project", help="A supplied project, for example evals/arithmetic.")
     repair.add_argument("--provider", choices=PROVIDERS, default="scripted", help="Chat client to use.")
+    repair.add_argument(
+        "--research",
+        action="store_true",
+        help="Optional: allow up to three bounded GitHub code searches (needs GITHUB_TOKEN).",
+    )
     ui = commands.add_parser("ui", help="Start the local web page.")
     ui.add_argument("--provider", choices=PROVIDERS, default="scripted", help="Chat client to use.")
     ui.add_argument("--port", type=int, default=7860, help="Local port for the web page.")
@@ -110,7 +120,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.reconfigure(errors="replace")
     args = build_parser().parse_args(argv)
     if args.command == "repair":
-        return run_repair(args.project, args.provider)
+        return run_repair(args.project, args.provider, args.research)
     if args.command == "ui":
         return run_ui(args.provider, args.port)
     return 2

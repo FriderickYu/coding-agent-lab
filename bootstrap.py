@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 from adapters.models.scripted import ScriptedClient
+from adapters.research.github_research import GitHubCodeSearch, read_token
 from adapters.sandbox.repair_tools import RepairTools
 from adapters.sandbox.runner import DockerRunner
 from core.ports import ChatClient, TraceRecorder
@@ -128,14 +131,27 @@ def make_client(provider: str, case_name: str) -> ChatClient:
     raise ValueError(f"Unknown provider {provider!r}. Choose one of: {', '.join(PROVIDERS)}")
 
 
-def build_service(provider: str = "scripted", runner: DockerRunner | None = None) -> RepairService:
-    """Connect the Docker runner, safe tools, chat client, agent, and service."""
+def build_service(
+    provider: str = "scripted",
+    runner: DockerRunner | None = None,
+    research: bool = False,
+    environ: Mapping[str, str] | None = None,
+) -> RepairService:
+    """Connect the Docker runner, safe tools, chat client, agent, and service.
+
+    Research stays off unless requested; only then is GITHUB_TOKEN read and the
+    GitHub adapter constructed, fresh for each repair so its budgets reset.
+    """
     if provider not in PROVIDERS:
         raise ValueError(f"Unknown provider {provider!r}. Choose one of: {', '.join(PROVIDERS)}")
     docker_runner = runner or DockerRunner()
+    token = read_token(os.environ if environ is None else environ) if research else None
 
     def make_agent(case_name: str, workspace: Path, recorder: TraceRecorder | None) -> RepairAgent:
         tools = RepairTools(workspace, docker_runner)
-        return RepairAgent(make_client(provider, case_name), tools, recorder=recorder)
+        research_port = GitHubCodeSearch(token) if token is not None else None
+        return RepairAgent(
+            make_client(provider, case_name), tools, recorder=recorder, research=research_port
+        )
 
     return RepairService(EVALS_ROOT, docker_runner.create_workspace, make_agent)

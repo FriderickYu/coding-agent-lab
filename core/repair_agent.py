@@ -9,8 +9,13 @@ from pathlib import Path
 from typing import Any
 
 from core.models import ModelAction, RepairResult, TestResult
-from core.ports import ChatClient, RepairToolsPort, TraceRecorder
-from core.prompts import case_request_message, system_message, tool_result_message
+from core.ports import ChatClient, RepairToolsPort, ResearchPort, TraceRecorder
+from core.prompts import (
+    case_request_message,
+    format_research_evidence,
+    system_message,
+    tool_result_message,
+)
 
 DEFAULT_MAX_DECISIONS = 8
 TRACE_PREVIEW_CHARS = 1500
@@ -21,11 +26,21 @@ ACTION_FIELDS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
     "run_tests": (frozenset(), frozenset({"summary"})),
     "edit_file": (frozenset({"path", "content"}), frozenset({"summary"})),
 }
+# Accepted by the parser only when a research port was injected (--research).
+RESEARCH_ACTION_FIELDS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
+    "search_github": (frozenset({"query"}), frozenset({"summary"})),
+}
 
 EARLY_EDIT_MESSAGE = (
     "Policy error: edit_file is allowed only after a successful read_file and a "
     "failing run_tests in this repair attempt. The edit was not applied."
 )
+EARLY_SEARCH_MESSAGE = (
+    "Policy error: search_github is allowed only after a successful read_file and a "
+    "failing run_tests in this repair attempt. No search was made."
+)
+# Actions that need local evidence (a successful read and a failing test) first.
+EVIDENCE_GATED = {"edit_file": EARLY_EDIT_MESSAGE, "search_github": EARLY_SEARCH_MESSAGE}
 
 
 class InvalidReplyError(ValueError):
@@ -42,8 +57,9 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def parse_action(raw: str) -> ModelAction:
+def parse_action(raw: str, allow_research: bool = False) -> ModelAction:
     """Parse one raw model reply into a ModelAction, or raise InvalidReplyError."""
+    allowed = {**ACTION_FIELDS, **RESEARCH_ACTION_FIELDS} if allow_research else ACTION_FIELDS
     if not isinstance(raw, str):
         raise InvalidReplyError("Reply must be text.")
     text = raw.strip()
@@ -59,10 +75,10 @@ def parse_action(raw: str) -> ModelAction:
     tool = data.get("tool")
     if not isinstance(tool, str):
         raise InvalidReplyError("Missing or non-string field: 'tool'.")
-    if tool not in ACTION_FIELDS:
+    if tool not in allowed:
         raise InvalidReplyError(f"Unknown tool: {tool!r}.")
 
-    required, optional = ACTION_FIELDS[tool]
+    required, optional = allowed[tool]
     fields = set(data) - {"tool"}
     missing = required - fields
     if missing:
@@ -94,6 +110,7 @@ class RepairAgent:
         tools: RepairToolsPort,
         max_decisions: int = DEFAULT_MAX_DECISIONS,
         recorder: TraceRecorder | None = None,
+        research: ResearchPort | None = None,
     ) -> None:
         if max_decisions < 1:
             raise ValueError("max_decisions must be at least 1.")
@@ -101,18 +118,21 @@ class RepairAgent:
         self.tools = tools
         self.max_decisions = max_decisions
         self.recorder = recorder
+        self.research = research  # None keeps search_github out of the parser entirely.
 
     def run(
         self, case_name: str, files: Sequence[str], workspace: Path | None = None
     ) -> RepairResult:
         """Attempt one repair and always return a RepairResult, never raise."""
         attempt = _Attempt(self.recorder)
-        messages = [system_message(), case_request_message(case_name, files)]
+        research_enabled = self.research is not None
+        messages = [system_message(research_enabled), case_request_message(case_name, files)]
         attempt.emit(
             "repair_started",
             case=case_name,
             files=list(files),
             max_decisions=self.max_decisions,
+            research_enabled=research_enabled,
         )
 
         for decision in range(1, self.max_decisions + 1):
@@ -122,7 +142,7 @@ class RepairAgent:
                 return attempt.finish(False, f"Model client error: {exc}", decision - 1, workspace)
 
             try:
-                action = parse_action(raw)
+                action = parse_action(raw, allow_research=research_enabled)
             except InvalidReplyError as exc:
                 attempt.emit("model_response", decision=decision, valid=False, error=str(exc))
                 return attempt.finish(False, f"Invalid model reply: {exc}", decision, workspace)
@@ -134,17 +154,19 @@ class RepairAgent:
                 valid=True,
                 tool=action.tool,
                 path=action.arguments.get("path"),
+                query=action.arguments.get("query"),
                 summary=action.summary,
             )
 
-            if action.tool == "edit_file" and not attempt.edit_allowed:
-                messages.append(tool_result_message(action.tool, EARLY_EDIT_MESSAGE, is_error=True))
+            if action.tool in EVIDENCE_GATED and not attempt.has_local_evidence:
+                policy_error = EVIDENCE_GATED[action.tool]
+                messages.append(tool_result_message(action.tool, policy_error, is_error=True))
                 attempt.emit(
                     "tool_result",
                     decision=decision,
                     tool=action.tool,
                     status="rejected",
-                    observation=EARLY_EDIT_MESSAGE,
+                    observation=policy_error,
                 )
                 continue
 
@@ -158,7 +180,10 @@ class RepairAgent:
                 )
                 continue
 
-            messages.append(tool_result_message(action.tool, observation))
+            if isinstance(observation, dict):  # Research evidence, shown with its source URLs.
+                messages.append(tool_result_message(action.tool, format_research_evidence(observation)))
+            else:
+                messages.append(tool_result_message(action.tool, observation))
             attempt.record_success(action, observation, decision)
 
             if isinstance(observation, TestResult) and observation.passed:
@@ -175,8 +200,10 @@ class RepairAgent:
             workspace,
         )
 
-    def _call_tool(self, action: ModelAction) -> str | TestResult:
+    def _call_tool(self, action: ModelAction) -> str | TestResult | dict[str, Any]:
         """Dispatch one validated action to the matching permitted tool."""
+        if action.tool == "search_github" and self.research is not None:
+            return self.research.search_github(action.arguments["query"])
         if action.tool == "read_file":
             return self.tools.read_file(action.arguments["path"])
         if action.tool == "edit_file":
@@ -199,8 +226,8 @@ class _Attempt:
         self.edited = False
 
     @property
-    def edit_allowed(self) -> bool:
-        """An edit needs a successful read and a failing test first."""
+    def has_local_evidence(self) -> bool:
+        """Edits and searches need a successful read and a failing test first."""
         return self.read_ok and self.saw_failing_test
 
     def emit(self, event: str, **payload: Any) -> None:
@@ -212,7 +239,9 @@ class _Attempt:
             except Exception:  # Optional observability must never break a repair.
                 pass
 
-    def record_success(self, action: ModelAction, observation: str | TestResult, decision: int) -> None:
+    def record_success(
+        self, action: ModelAction, observation: str | TestResult | dict[str, Any], decision: int
+    ) -> None:
         """Update the evidence after a tool call succeeded and log it."""
         if action.tool == "read_file":
             self.read_ok = True
@@ -234,6 +263,17 @@ class _Attempt:
                 passed=observation.passed,
                 returncode=observation.returncode,
                 observation=_preview(observation.output),
+            )
+        elif isinstance(observation, dict):
+            # Keep every source URL even if the text preview is shortened (provenance).
+            self.emit(
+                "tool_result",
+                decision=decision,
+                tool=action.tool,
+                status="ok",
+                query=observation.get("query"),
+                sources=[source.get("url") for source in observation.get("sources") or []],
+                observation=_preview(format_research_evidence(observation)),
             )
         else:
             self.emit(
