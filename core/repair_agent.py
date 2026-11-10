@@ -139,13 +139,17 @@ class RepairAgent:
             try:
                 raw = self.client.chat(list(messages))
             except Exception as exc:  # A client failure ends the attempt, visibly.
-                return attempt.finish(False, f"Model client error: {exc}", decision - 1, workspace)
+                return attempt.finish(
+                    False, f"Model client error: {exc}", decision - 1, workspace, "client_error"
+                )
 
             try:
                 action = parse_action(raw, allow_research=research_enabled)
             except InvalidReplyError as exc:
                 attempt.emit("model_response", decision=decision, valid=False, error=str(exc))
-                return attempt.finish(False, f"Invalid model reply: {exc}", decision, workspace)
+                return attempt.finish(
+                    False, f"Invalid model reply: {exc}", decision, workspace, "invalid_reply"
+                )
 
             messages.append({"role": "assistant", "content": raw.strip()})
             attempt.emit(
@@ -188,9 +192,15 @@ class RepairAgent:
 
             if isinstance(observation, TestResult) and observation.passed:
                 if attempt.edited:
-                    return attempt.finish(True, "Tests pass after the edit.", decision, workspace)
+                    return attempt.finish(
+                        True, "Tests pass after the edit.", decision, workspace, "repaired"
+                    )
                 return attempt.finish(
-                    False, "Tests passed before any edit: no reproducible bug.", decision, workspace
+                    False,
+                    "Tests passed before any edit: no reproducible bug.",
+                    decision,
+                    workspace,
+                    "no_reproducible_bug",
                 )
 
         return attempt.finish(
@@ -198,6 +208,7 @@ class RepairAgent:
             f"Decision budget of {self.max_decisions} reached without a verified repair.",
             self.max_decisions,
             workspace,
+            "budget_exhausted",
         )
 
     def _call_tool(self, action: ModelAction) -> str | TestResult | dict[str, Any]:
@@ -280,9 +291,18 @@ class _Attempt:
                 "tool_result", decision=decision, tool=action.tool, status="ok", observation=_preview(observation)
             )
 
-    def finish(self, passed: bool, reason: str, decisions_used: int, workspace: Path | None) -> RepairResult:
-        """Log the outcome and build the RepairResult."""
-        self.emit("repair_finished", passed=passed, reason=reason, decisions_used=decisions_used)
+    def finish(
+        self, passed: bool, reason: str, decisions_used: int, workspace: Path | None, outcome: str
+    ) -> RepairResult:
+        """Log the outcome (with a fixed outcome code) and build the RepairResult."""
+        self.emit(
+            "repair_finished",
+            passed=passed,
+            outcome=outcome,
+            reason=reason,
+            decisions_used=decisions_used,
+            changed_files=list(self.changed_files),
+        )
         return RepairResult(
             passed=passed,
             trace=list(self.trace),

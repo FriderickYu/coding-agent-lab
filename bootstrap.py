@@ -9,6 +9,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from adapters.models.scripted import ScriptedClient
+from adapters.observability.langfuse import (
+    LangfuseTrajectoryRecorder,
+    create_langfuse_client,
+    read_langfuse_settings,
+)
 from adapters.research.github_research import GitHubCodeSearch, read_token
 from adapters.sandbox.repair_tools import RepairTools
 from adapters.sandbox.runner import DockerRunner
@@ -155,3 +160,9 @@ def build_service(
         )
 
     return RepairService(EVALS_ROOT, docker_runner.create_workspace, make_agent)
+
+
+def build_observer(environ: Mapping[str, str] | None = None) -> LangfuseTrajectoryRecorder:
+    """Validate the Langfuse variables, then create the optional trajectory recorder."""
+    settings = read_langfuse_settings(os.environ if environ is None else environ)
+    return LangfuseTrajectoryRecorder(create_langfuse_client(settings))

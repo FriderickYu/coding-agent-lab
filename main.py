@@ -6,7 +6,7 @@ import argparse
 import sys
 from typing import Any
 
-from bootstrap import PROVIDERS, build_service
+from bootstrap import PROVIDERS, build_observer, build_service
 
 PREVIEW_LINES = 12
 
@@ -64,11 +64,24 @@ class PrintRecorder:
         print(format_event(event, payload), flush=True)
 
 
-def run_repair(project: str, provider: str, research: bool = False) -> int:
+class FanOutRecorder:
+    """Passes each event to several recorders in order (terminal first, then observers)."""
+
+    def __init__(self, *recorders: Any) -> None:
+        self.recorders = recorders
+
+    def record(self, event: str, payload: dict[str, Any]) -> None:
+        for recorder in self.recorders:
+            recorder.record(event, payload)
+
+
+def run_repair(project: str, provider: str, research: bool = False, observe: bool = False) -> int:
     """Run one repair, print the trace and summary, and return the exit status."""
     try:
         service = build_service(provider, research=research)
-        result = service.repair(project, recorder=PrintRecorder())
+        observer = build_observer() if observe else None  # Validates variables before any repair.
+        recorder = FanOutRecorder(PrintRecorder(), observer) if observer else PrintRecorder()
+        result = service.repair(project, recorder=recorder)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -85,6 +98,11 @@ def run_repair(project: str, provider: str, research: bool = False) -> int:
         test = result.latest_test
         print(f"  {'PASSED' if test.passed else 'FAILED'} (exit {test.returncode})")
         print(_indent(test.output, max_lines=5, tail=True))
+    if observer is not None:
+        if observer.failures:
+            print(f"Langfuse: {observer.failures} recording step(s) failed; see warnings. Repair unaffected.")
+        else:
+            print(f"Langfuse: trajectory recorded. {observer.trace_url() or ''}".rstrip())
     return 0 if result.passed else 1
 
 
@@ -108,6 +126,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Optional: allow up to three bounded GitHub code searches (needs GITHUB_TOKEN).",
     )
+    repair.add_argument(
+        "--observe",
+        action="store_true",
+        help="Optional: record the public trajectory in Langfuse Cloud (needs LANGFUSE_* variables).",
+    )
     ui = commands.add_parser("ui", help="Start the local web page.")
     ui.add_argument("--provider", choices=PROVIDERS, default="scripted", help="Chat client to use.")
     ui.add_argument("--port", type=int, default=7860, help="Local port for the web page.")
@@ -120,7 +143,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.reconfigure(errors="replace")
     args = build_parser().parse_args(argv)
     if args.command == "repair":
-        return run_repair(args.project, args.provider, args.research)
+        return run_repair(args.project, args.provider, args.research, args.observe)
     if args.command == "ui":
         return run_ui(args.provider, args.port)
     return 2
