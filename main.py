@@ -83,6 +83,14 @@ def run_repair(project: str, provider: str) -> int:
     return 0 if result.passed else 1
 
 
+def run_ui(provider: str, port: int) -> int:
+    """Start the local Gradio page on this computer only."""
+    from adapters.gradio_ui import create_demo  # Imported lazily: Gradio is slow to load.
+
+    create_demo(build_service(provider)).launch(server_name="127.0.0.1", server_port=port, share=False)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Define the command-line interface."""
     parser = argparse.ArgumentParser(description="Teaching-sized Python repair agent.")
@@ -90,6 +98,9 @@ def build_parser() -> argparse.ArgumentParser:
     repair = commands.add_parser("repair", help="Repair a copy of one supplied project under evals/.")
     repair.add_argument("project", help="A supplied project, for example evals/arithmetic.")
     repair.add_argument("--provider", choices=PROVIDERS, default="scripted", help="Chat client to use.")
+    ui = commands.add_parser("ui", help="Start the local web page.")
+    ui.add_argument("--provider", choices=PROVIDERS, default="scripted", help="Chat client to use.")
+    ui.add_argument("--port", type=int, default=7860, help="Local port for the web page.")
     return parser
 
 
@@ -100,6 +111,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "repair":
         return run_repair(args.project, args.provider)
+    if args.command == "ui":
+        return run_ui(args.provider, args.port)
     return 2
 
 
